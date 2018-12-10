@@ -1,0 +1,238 @@
+---
+title: "Descriptive Analysis on Medicare Part D Drug Prescription & Overdose"
+author: "May Shen, mshen@axialhealthcare.com"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    code_folding: hide
+    fig_height: 10
+    fig_width: 10
+    theme: cerulean
+    toc: yes
+    toc_float:
+      collapsed: yes
+---
+
+This is a brief report on the patterns of U.S. Medicare Part D drug prescriptions and fatal drug overdoses in 2016. The state-level summary of drug prescriptions data were retrieved from [data.cms.gov](https://data.cms.gov/Medicare-Part-D/Part-D-Prescriber-State-Summary-Report-Calendar-Ye/hjv3-puc7). The fatal drug overdoses data were retrieved from [CDC](https://www.cdc.gov/nchs/pressroom/sosmap/drug_poisoning_mortality/drug_poisoning.htm).
+
+The purpose of this report is to demonstrate some of the ways that we explore and visualize data at axialHealthcare, not necessarily to showcase comprehensive analyses on the subject matter. In fact, some of the analyses would be quite primitive given limited data resources.  
+
+```{r setup, include=FALSE}
+## load libraries
+library(data.table)
+library(DT)
+library(dplyr)
+library(kableExtra)
+library(ggplot2)
+library(gridExtra)
+library(knitr)
+library(maps)
+## knit options
+knitr::opts_chunk$set(echo = TRUE, warning = F, error = F, fig.width=8, fig.height=6)
+```
+
+## The Data
+
+Let's take a look at the data to begin our explorations. 
+
+First, the prescription data. Based on the table below, we can see that the table aggregates some metrics such as the number of prescribers and the number of prescriptions for each drug within each state. The table includes some interesting information such as opioid drug flag and antipsychotic drug flag. Note that to make things fit on one page, the wide table is shown in three separate tables, with 6-7 columns in each one.   
+
+```{r import_data}
+prescription <- fread('https://data.cms.gov/api/views/hjv3-puc7/rows.csv?accessType=DOWNLOAD')
+
+DT::datatable(head(prescription[,1:6]))
+
+DT::datatable(head(prescription[,7:13]))
+
+DT::datatable(head(prescription[,14:20]))
+
+```
+
+Second, the fatal overdose data. This table is quite straightforward. It includes the state abbreviations, drug overdose death counts, and the drug overdose death rate per 100,000.
+
+```{r}
+overdoses <- fread('https://www.cdc.gov/nchs/pressroom/sosmap/drug_poisoning_mortality/DRUG_DEATHS2016.csv')
+
+DT::datatable(head(overdoses))
+```
+
+## Analysis Goal
+
+In business settings, data scientists often set analysis goals based on asks from the business. In this demo, let's visualize drug prescribing patterns via available metrics at the state level on maps. The available metrics include:
+
+1. Number of Medicare Part D Claims
+2. Number of Standardized 30-Day Part D Fills
+3. Aggregate Cost Paid for Part D Claims
+4. Number of Medicare Part D Claims for Beneficiaries 65+
+5. Number of Standardized 30-Day Part D Fills for Beneficiaries 65+
+6. Aggregate Cost Paid for Part D Claims for Beneficiaries 65+
+7. Aggregate Cost Share for Beneficiaries with Low Income Subsidy
+8. Aggregate Cost Share for Beneficiaries with No Low Income Subsidy
+ 
+Each of these metrics can be shown for all drugs, opioids, long-acting opioids, antibiotics, or antipsychotics. Also, they can be shown as an aggregate, or an approximate state-level ratio (see more details later).
+
+Again, the goals above are just some primitive examples to showcase the workflow, not a comprehensive exploration of the data.
+
+## Data Pre-Processing
+
+Next, let's clean up the data for visualization. 
+
+First, using the drug overdose death counts and the drug overdose death rate per 100,000, we can get an approximate population for each state in the *overdoses* table. Also, to be able to join this table with the prescriptions table, let's add a column *state_name* to it.    
+
+```{r}
+overdoses[, `:=` (
+  DEATHS = as.numeric(gsub(",", "", DEATHS)),
+  population = as.numeric(gsub(",", "", DEATHS)) / RATE * 100000,
+  state_name = state.name[match(STATE, state.abb)])]
+```
+
+Second, let's take a look at some summary statistics of the metrics to be visualized.
+
+```{r}
+## the metrics that we care about
+metrics = c('Number of Medicare Part D Claims',
+            'Number of Standardized 30-Day Part D Fills',
+            'Aggregate Cost Paid for Part D Claims',
+            'Number of Medicare Part D Claims for Beneficiaries 65+',
+            'Number of Standardized 30-Day Part D Fills for Beneficiaries 65+',
+            'Aggregate Cost Paid for Part D Claims for Beneficiaries 65+',
+            'Aggregate Cost Share for Beneficiaries with Low Income Subsidy',
+            'Aggregate Cost Share for Beneficiaries with No Low Income Subsidy')
+
+## flags for drug types
+drug_flags <- c('Opioids','Long-Acting Opioids',
+                'Antibiotics','Antipsychotics','')
+
+## melt the data to long format to summarize 
+summary_tbl <- data.table::melt(prescription,
+                id.vars = c('State Name', 'Drug Name'),
+                measure.vars = metrics, variable.name = 'Metric') %>% 
+  group_by(Metric) %>% 
+  summarise(mean = mean(value, na.rm = T), 
+            median = median(value, na.rm = T),
+            SD = sd(value, na.rm = T), 
+            min = min(value, na.rm = T),
+            max = max(value, na.rm = T),
+            n_missing = sum(is.na(value)))  
+
+## show summary using kable
+kable_styling(kable(summary_tbl))  
+```
+
+The 3 metrics relevant to beneficiary 65+ have quite some missing values. According to [CMS website](https://data.cms.gov/Medicare-Part-D/Part-D-Prescriber-State-Summary-Report-Calendar-Ye/hjv3-puc7), these metrics would be suppressed if the number of Medicare Part D claims for beneficiaries 65+ or less than 65 year old is between 1 and 10. Thus the estimates for these three metrics would be inaccurate. Let's remove these three metrics for now.
+
+```{r}
+metrics <- metrics[-(4:6)]
+metrics_tbl <- data.table(metric = metrics, 
+                          var_name = c('n_claims', 'n_fills', 'cost',
+                                       'cost_low', 'cost_no_low'))
+```
+
+Next, let's prepare tables for final visualization. We'll need tables with state-level aggregated metrics across different drug types and a normalized version (the aggregate divided by state population).
+
+```{r}
+# an empty list to host final tables
+visual_tbl <- list() 
+
+# add a drug type lable to identify certain types of drugs later
+prescription[, drug_type := paste(
+  ifelse(`Opioid Drug Flag` == 'Y', 'Opioids', ''),
+  ifelse(`Long-Acting Opioid Drug Flag` == 'Y', 'Long-Acting Opioids', ''),
+  ifelse(`Antibiotic Drug Flag` == 'Y', 'Antibiotics', ''),
+  ifelse(`Antipsychotic Drug Flag` == 'Y', 'Antipsychotics', ''))]
+
+# normalize types
+norm_types <- c('Aggregate', 'Ratio')
+  
+# loop through metrics and drug types to get tables for aggregate data
+for (drug_i in drug_flags) {
+  visual_tbl[[drug_i]] <- prescription[ 
+    grepl(drug_i, drug_type) & `State Name` %in% overdoses$state_name, 
+    .(n_claims = sum(`Number of Medicare Part D Claims`, na.rm = T),
+      n_fills = sum(`Number of Standardized 30-Day Part D Fills`, na.rm = T),
+      cost = sum(`Aggregate Cost Paid for Part D Claims`, na.rm = T),
+      cost_low = sum(`Aggregate Cost Share for Beneficiaries with Low Income Subsidy`, na.rm = T),
+      cost_no_low = sum(`Aggregate Cost Share for Beneficiaries with No Low Income Subsidy`, na.rm = T),
+      population = overdoses[match(`State Name`, state_name), population]),
+    by = 'State Name'] %>% 
+    melt(id.vars = c('State Name', 'population'),
+         variable.name = 'var_name', value.name = 'Aggregate') %>% 
+    mutate(metric = metrics_tbl$metric[match(var_name, metrics_tbl$var_name)],
+           Ratio = Aggregate/population * 1000,
+           drug_type = ifelse(drug_i=='', 'All Drugs', drug_i)) %>% 
+    melt(measure.vars = c('Aggregate','Ratio'),
+         variable.name = 'normal_type')
+}
+
+## format overdose data into the same structure
+overdoses_tmp <- overdoses[, .(`State Name` = state_name,
+                      population = population,
+                      metric = 'Fatal Drug Overdose',
+                      var_name = 'fatal_drug_od',
+                      Aggregate = DEATHS,
+                      Ratio = RATE / 1000,
+                      drug_type = 'All Drugs')] %>% 
+  melt(measure.vars = c('Aggregate','Ratio'), variable.name = 'normal_type')
+
+## combine all data.frames into a final one
+data <- do.call(function(...){rbind(..., make.row.names=F)}, visual_tbl) %>% 
+  rbind(overdoses_tmp)
+```
+
+## Visualization
+
+First, let's write a function that plots the pattern of a selected metric on a map.
+```{r plot_function}
+# write a function to plot the data
+f_plot <- function(metric_i, norm_i, drug_i) {
+  
+  title_i <- ifelse(metric_i == 'Fatal Drug Overdose', metric_i, 
+                    paste(metric_i, drug_i, sep = ' - '))
+  legend_i <- ifelse(norm_i == 'Aggregate', 'State Aggregate', 'State Ratio Per Thousand')
+
+  # map data
+  all_states <- map_data("state")
+
+  plot <- data %>% 
+    filter(metric == metric_i, normal_type == norm_i, drug_type == drug_i) %>% 
+    mutate( state = tolower(`State Name`) ) %>%
+    merge( all_states, by.x="state", by.y="region" ) %>% 
+    select(-subregion, -order) %>% 
+    ggplot() + 
+    geom_map(map = all_states, aes( x = long, y = lat, map_id = state,fill = value) )  + 
+    geom_text( data = data.frame( state.center, state.abb ),
+              aes( x = x, y=y,label = state.abb), size = 3) +
+    scale_fill_continuous( low = 'gray85', high = 'darkred',
+                           guide = guide_colorbar(ticks = FALSE, barheight = 1,
+                                                  barwidth = 10, title.vjust = .8, 
+                                                  values = c(0.2,0.3))) + 
+    labs(title = title_i, fill = legend_i) +
+    theme(axis.text = element_blank(), 
+          axis.title = element_blank(), 
+          axis.ticks = element_blank(),
+          legend.position = "bottom" )
+  return(plot)
+}
+```
+
+To test the function, let's plot the ratio of part D claims on opioids and the ratio of fatal drug overdoses.
+
+```{r eval=T,}
+
+f_plot('Number of Medicare Part D Claims', 'Ratio', 'Opioids')
+
+f_plot('Fatal Drug Overdose', 'Ratio', 'All Drugs')
+
+```
+
+Given that there are 5 metrics, each of which can be shown with 5 drug types and 2 normalization types (state aggregate or ratio per 1000 people). This consists of 5x5x2 = 50 plots to be shown. We also have the fatal drug overdose data, either aggregated or the ratio, which means two additional plots. Together we have 52 possible plots! That's a lot to be plotted and can easily confuse the readers.
+
+Let's instead create a shiny app, on the page of which readers can select the metrics and filters for the plot that they wish to see. The shiny app would come in handy for other folks across the company to explore the patterns and glean insights.
+
+```{r}
+# create directory if not exist
+if( ! dir.exists('data') ) dir.create('data')
+# save data
+saveRDS(data, file = 'data/data.rds')
+```
+
